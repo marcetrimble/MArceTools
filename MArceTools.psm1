@@ -4,233 +4,376 @@
 <#
 .SYNOPSIS
 Verifies if the current user has administrator permissions.
+
 .DESCRIPTION
-This command returns True when the current user is a member of the built-on Administrators group, and False otherwise.
+This function returns True when the current user is a member of the built-on Administrators group, and False 
+otherwise.
 #>
-function Check-Admin {
-    $current_sec_id = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()))
-    return $current_sec_id.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+function Test-IsAdministrator {
+    try {
+        $AdminRole = [Security.Principal.WindowsBuiltInRole]::Administrator
+        $Identity =  [Security.Principal.WindowsIdentity]::GetCurrent()
+        $CurrentSecId = New-Object Security.Principal.WindowsPrincipal($Identity)
+        $CurrentSecId.IsInRole($AdminRole)
+    }
+    catch {
+        Write-Warning "Error checking administrator privileges: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 <#
 .SYNOPSIS
-Copies to clipboard the current location.
+Copies to system clipboard a location. By default uses the current location.
+
 .DESCRIPTION
 Retrieves the current location and saves it to the local clipboard as plain text.
+
+.PARAMETER Path
+Defines a custom path to a directory to be copied to the system clipboard.
+
+.PARAMETER Verbose
+Switches on or off the information messages of the script.
 #>
 function Copy-Location {
-    $location = Get-Location | Select-Object -Expand Path
-    $location | Set-Clipboard
-    Write-Output "`"$location`" copied to clipboard"
+    [CmdletBinding()]
+    param(
+        [string] $Path = (Get-Location | Select-Object -ExpandProperty Path)
+    )
+
+    try{
+        $ResolvedPath = Resolve-Path -Path $Path -ErrorAction Stop | Select-Object -ExpandProperty Path
+        $ResolvedPath | Set-Clipboard
+        Write-Verbose "`"$ResolvedPath`" copied to clipboard"
+    }
+    catch {
+        Write-Error "Failed to copy path to clipboard: $_"
+    }
 }
 
 <#
 .SYNOPSIS
 Finds and returns a copy of a SketchUp license for internal testing.
+
 .DESCRIPTION
-Given the SketchUp version, this cmdlet finds a local copy of a license for internal testing, copies the contents 
+Given the SketchUp version, this cmdlet finds a local copy of a license for internal testing, copies the contents
 to the local clipboard
+
 .PARAMETER Year
 Specifies the year version of the required license.
 #>
 function Copy-SULicence {
+    [CmdletBinding()]
     param(
-        [ValidateSet("2023", "2024", "2025")][string] $Year
+        [string] $Year
     )
-    Get-Secret -Name "SU_LIC_$Year" -AsPlainText | Set-Clipboard
+    try {
+        $secret = Get-Secret -Name "SU_LIC_$Year" -AsPlainText -ErrorAction Stop
+        $secret | Set-Clipboard
+    }
+    catch {
+        Write-Error "A licence for the provided version '$Year' is not available"
+    }
 }
 
 <#
 .SYNOPSIS
 Shows the currently free system memory
+
 .DESCRIPTION
 This function retrieves the amount of available physical memory (RAM) on a Windows system and returns the value in
 megabytes (MB)
 #>
-function Get-AvailableRam {
-    $freeMem = Get-CimInstance -ClassName Win32_OperatingSystem `
-        | Select-Object FreePhysicalMemory `
-        | Select-Object -ExpandProperty FreePhysicalMemory
-    return $freeMem/1Mb
+function Get-FreeMemoryGB {
+    try {
+        $FreeMemoryMB = Get-CimInstance -ClassName Win32_OperatingSystem |
+            Select-Object -ExpandProperty FreePhysicalMemory
+        $FreeMemoryGB = $FreeMemoryMB / 1MB
+        return $FreeMemoryGB
+    }
+    catch {
+        Write-Error "Failed to retrieve free physical memory: `n`t$_"
+    }
 }
 
 <#
 .SYNOPSIS
 Shows the size in memory occupied by a folder
+
 .DESCRIPTION
 This function calculates and displays the size of a specified folder in various units (bytes, kibibytes, mebibytes,
 and gibibytes)
+
 .PARAMETER Folder
 Specifies the system directory to be measured
 #>
 function Get-FolderSize {
+    [CmdletBinding()]
     param(
-      [string] $Folder = '.'
+        [ValidateScript({Test-Path -Path $_ -PathType Container})]
+        [string] $Folder = (Get-Location | Select-Object -ExpandProperty Path)
     )
 
-    if (Test-Path $Folder) {
-        $size = Get-ChildItem -Recurse -Path $folder `
-            | Measure-Object -Property Length -Sum `
-            | Select-Object -ExpandProperty Sum
+    $size = Get-ChildItem -Recurse -File -Path $Folder |
+        Measure-Object -Property Length -Sum |
+        Select-Object -ExpandProperty Sum
 
-        $fileSize = New-Object -TypeName psobject -Property @{
-            Name     = Resolve-Path $Folder
-            size_B   = $size
-            size_KiB = $size/1Kb
-            size_MiB = $size/1Mb
-            size_GiB = $size/1Gb
-        }
+    $fileSize = New-Object -TypeName psobject -Property @{
+        Name     = Resolve-Path $Folder
+        size_B   = $size
+        size_KiB = $size/1Kb
+        size_MiB = $size/1Mb
+        size_GiB = $size/1Gb
+    }
 
-        return $fileSize | Format-List Name, size_B, size_KiB, size_MiB, size_GiB
-    }
-    else {
-        Write-Error "Directory not found."
-    }
+    # Not using Format-List because the output object don't allow for member selection
+    return $fileSize
 }
 
 <#
 .SYNOPSIS
 Shows information about a Jira issue
+
 .DESCRIPTION
 This function uses the Jira API to query for general information about a specified Jira issue.
+
 .PARAMETER IssueId
 Specifies the issue ID of the issue to be queried
+
 .PARAMETER Board
 Specifies Jira board ID of the issue to be queried
 #>
 function Get-JiraIssue {
+    [CmdletBinding()]
     param (
-        [Parameter(Mandatory=$true)] [string] $IssueId,
-        [string] $Board = "SUDO"
+        [Parameter(Mandatory=$true)] [int] $IssueId,
+        [string] $Board = "SUDO",
+        [string] $VaultEntry = "Jira PAT pdOas913 (marce)"
     )
+    try {
+        # Retrieve token securely
+        $Token = Get-Secret -Name $VaultEntry
+        if (-not $Token) {
+            throw "Failed to retrieve Jira Personal Access Token"
+        }
 
-    $token = Get-Secret -Name "Jira PAT pdOas913 (marce)"
-    $headers = @{ Accept = "application/json" }
-    $url = "https://jira.trimble.tools/rest/api/latest/issue/$board-$issueId"
-    $res = Invoke-RestMethod -Uri $url -Headers $headers -Authentication Bearer -Token $token
+        $Headers = @{ Accept = "application/json" }
+        $Url = "https://jira.trimble.tools/rest/api/latest/issue/$Board-$IssueId"
 
-    $issueInfo = New-Object -TypeName psobject -Property @{
-        IssueID      = "$board-$issueid"
-        Summary      = $res.fields.summary
-        Status       = $res.fields.status.name
-        Assignee     = "$($res.fields.assignee.displayName) - $($res.fields.assignee.emailAddress)"
-        Verifier     = "$($res.fields.customfield_15511.displayName) - $($res.fields.customfield_15511.emailAddress)"
-        Reporter     = "$($res.fields.reporter.displayName) - $($res.fields.reporter.emailAddress)"
-        WhatToTest   = $res.fields.customfield_15509
-        Description  = $res.fields.description
-        Created      = $res.fields.created
-        Updated      = $res.fields.updated
-        DueDate      = $res.fields.duedate
-        JiraIssueURL = "https://jira.trimble.tools/browse/$board-$issueId"
+        try {
+            $Res = Invoke-RestMethod -Uri $Url -Headers $Headers -Authentication Bearer -Token $Token
+            $Data = $Res.fields
+        }
+        catch {
+            throw "Failed to retrieve Jira issue details: $_"
+        }
+
+        # Create the issue information object
+        $IssueInfo = New-Object -TypeName psobject -Property @{
+            IssueID      = "$board-$issueid"
+            Summary      = $data.summary
+            Status       = $data.status.name
+            Assignee     = "$($data.assignee.displayName) - $($data.assignee.emailAddress)"
+            Verifier     = "$($data.customfield_15511.displayName) - $($data.customfield_15511.emailAddress)"
+            Reporter     = "$($data.reporter.displayName) - $($data.reporter.emailAddress)"
+            WhatToTest   = $data.customfield_15509
+            Description  = $data.description
+            Created      = $data.created
+            Updated      = $data.updated
+            DueDate      = $data.duedate
+            JiraIssueURL = "https://jira.trimble.tools/browse/$board-$issueId"
+        }
+
+        return $IssueInfo | Select-Object IssueID, Summary,  Status,  Assignee,  Verifier,  Reporter,  WhatToTest, 
+            Description,  Created,  Updated,  DueDate,  JiraIssueURL
     }
-
-    return $issueInfo | Select-Object IssueID, Summary,  Status,  Assignee,  Verifier,  Reporter,  WhatToTest,  `
-    Description,  Created,  Updated,  DueDate,  JiraIssueURL
+    catch {
+        Write-Error "An error ocurred: $_"
+    }
 }
 
 <#
 .SYNOPSIS
 Returns a list of user defined variables
+
 .DESCRIPTION
 The Get-UDVariable PowerShell function retrieves a list of variables available in the current session,
 excluding specific system variables and special variables used internally by PowerShell. This ensures that it only
 returns user-defined variables from the current session.
 #>
 function Get-UDVariable {
-    Get-Variable | Where-Object {
-        (
-            @(
-                "FormatEnumerationLimit",
-                "MaximumAliasCount",
-                "MaximumDriveCount",
-                "MaximumErrorCount",
-                "MaximumFunctionCount",
-                "MaximumVariableCount",
-                "PGHome",
-                "PGSE",
-                "PGUICulture",
-                "PGVersionTable",
-                "PROFILE",
-                "PSSessionOption"
-            ) -notcontains $_.name
-        ) -and ` (
-            ([psobject].Assembly.GetType('System.Management.Automation.SpecialVariables').GetFields('NonPublic,Static') | Where-Object FieldType -eq ([string]) | ForEach-Object GetValue $null)
-        ) -notcontains $_.name
-    }
+    $excludedVariables = @("FormatEnumerationLimit", "MaximumAliasCount", "MaximumDriveCount",
+        "MaximumErrorCount", "MaximumFunctionCount", "MaximumVariableCount", "PGHome", "PGSE", "PGUICulture",
+        "PGVersionTable", "PROFILE", "PSSessionOption")
+    $specialVariables = [psobject].Assembly.GetType('System.Management.Automation.SpecialVariables').
+        GetFields('NonPublic,Static') | Where-Object { $_.FieldType -eq [string] } |
+        ForEach-Object {$_.GetValue($null)}
+    Get-Variable | Where-Object {$excludedVariables + $specialVariables -notcontains $_.Name}
 }
 
 <#
 .SYNOPSIS
 Generate a random username
+
 .DESCRIPTION
 This function returns a randomized string with the format 5 letters + 3 numbers
 #>
 function Get-Username {
-    $abc1 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".toCharArray()
-    $abc2 = "abcdefghijklmnopqrstuvwxyz".toCharArray()
-    $num = "0123456789".toCharArray()
-
-    $x = $abc1+$abc2 | Get-Random -Count 5
-    $x = [System.String]::Join("", $x)
-
-    $y = $num | Get-Random -Count 3
-    $y = [System.String]::Join("", $y)
-
-    return $x+$y
+    $Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".ToCharArray()
+    $Username = -join (Get-Random -InputObject $Chars[0..51] -Count 5)
+    $Numbers = -join (Get-Random -InputObject $Chars[-10..-1] -Count 3)
+    return $Username + $Numbers
 }
 
 <#
 .SYNOPSIS
 Recreates the functionality of UNIX systems utlity which
+
 .DESCRIPTION
 Shows the pathnames of the files which would be executed in the current environment, had its argument been given as
 a command. This is done by searching using Get-Commands cmdlet and extracting the Path attribute with Select-Object
 cmdlet
+
 .PARAMETER FileName
-Specifies the filename to look for
+Specifies the filename to look up for the current environment.
 #>
-function which {
+function Get-CommandPath {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)] [string] $FileName
     )
-    Get-Command -Name $FileName -ErrorAction SilentlyContinue `
-    | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+    Get-Command -Name $FileName -ErrorAction SilentlyContinue | 
+        Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
 }
 
-# WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP 
+<#
+.SYNOPSIS
+Copies a file from the host machine to a specified Hyper-V virtual machine.
+
+.DESCRIPTION
+This function copies a single file from the local machine to the Downloads folder of a specified Hyper-V virtual 
+machine. It utilizes the `Copy-VMFile` cmdlet to perform the file transfer.
+
+.PARAMETER VM
+Specifies the target Hyper-V virtual machine. This parameter is mandatory.
+
+.PARAMETER File
+Specifies the path to the file on the host machine that will be copied. This parameter is mandatory. The path must 
+point to an existing file.
+
+.EXAMPLE
+Copy-ToVM -VM "MyVM" -File "C:\Temp\MyFile.txt"
+Copies the file "C:\Temp\MyFile.txt" to the "Downloads" folder of the virtual machine named "MyVM".
+
+.NOTES
+Requires the Hyper-V module to be installed. The destination path on the virtual machine is fixed to 
+"C:\users\user\Downloads\". The destination filename will be the same as the source filename. Error handling is 
+included to catch and display any exceptions during the file transfer.
+
+.INPUTS
+Microsoft.HyperV.PowerShell.VirtualMachineBase, String
+
+.OUTPUTS
+None or ErrorRecord
+
+.FUNCTIONALITY
+Copies a file to a Hyper-V VM.
+#>
+function Copy-ToVM {
+    [CmdletBinding()]
+	param(
+	    [Parameter(Mandatory=$True)][Microsoft.HyperV.PowerShell.VirtualMachineBase] $VM,
+	    [Parameter(Mandatory=$True)][ValidateScript({Test-Path -Path $_ -PathType Leaf})][string] $File
+	)
+    try {
+        $FileFullName = Resolve-Path -Path $File | Select-Object -ExpandProperty Path
+        $CopyParams = @{
+            VM = $VM
+            SourcePath = $FileFullName
+            DestinationPath = "C:\users\user\Downloads\$(Split-Path $FileFullName -leaf)"
+            FileSource = "Host"
+        }
+        Copy-VmFile @CopyParams
+    }
+    catch {
+        Write-Error $_
+    }
+}
+
+<#
+.SYNOPSIS
+Displays the latest SU installers found in the user's Downloads\SU_INSTALLERS directory.
+
+.DESCRIPTION
+This function searches recursively within the user's Downloads\SU_INSTALLERS directory for files, sorts them by 
+creation time, and returns the specified number of the most recent installers.
+
+.PARAMETER last
+Specifies the number of latest installers to display. Defaults to 1.
+
+.EXAMPLE
+Show-LatestSUInstallers
+Displays the latest SU installer.
+
+.EXAMPLE
+Show-LatestSUInstallers -last 5
+Displays the 5 latest SU installers.
+
+.NOTES
+Requires that the directory '$Env:USERPROFILE\Downloads\SU_INSTALLERS' exists.
+The output includes the CreationTime and FullName of each installer file.
+#>
+function Show-LatestSUInstallers {
+    [CmdletBinding()]
+    param(
+        [int] $Last = 1
+    )
+    return Get-ChildItem -Path $Env:USERPROFILE\Downloads\SU_INSTALLERS -Filter "*.exe" -Recurse |
+        Sort-Object -Property Creationtime |
+        Select-Object CreationTime, Fullname -Last $last
+}
 
 <#
 .SYNOPSIS
 Show the latest plan run results from a specified bamboo plan
+
 .DESCRIPTION
-This function uses the Bamboo API to query for information on the latest run from a specified Bamboo project and plan.
+This function uses the Bamboo API to query for information on the latest run from a specified Bamboo project and
+plan.
+
 .PARAMETER ProjectKey
 Specifies the Bamboo project key that contains the plan to be queried
+
 .PARAMETER BuildKey
 Specifies the Build key that identifies the plan to be queried
+
 .PARAMETER BuildState
 Filter queried plan results by their final state: "Successful" or "Failed". Empty string acts as placeholder for no
 filtering.
+
 .PARAMETER maxResults
 #>
 function Get-BambooResult {
+    [CmdletBinding()]
     param(
         [string] $ProjectKey = "SU",
         [string] $BuildKey = "SMI",
         [ValidateSet("Successful", "Failed", "")][string] $BuildState,
-        [int] $maxResults = 5
+        [int] $MaxResults = 5,
+        [string] $VaultEntry = "Bamboo PAT (marce)"
     )
-    $token = (Get-Secret -Name "Bamboo PAT (marce)").Password
-    $url = "https://bamboo.trimble.tools/rest/api/latest/result/$ProjectKey-$BuildKey"
-    $headers  = @{ Accept = "application/json" }
-    $body = @{ "max-results" = $maxResults; buildstate = $BuildState }
-    $response =  Invoke-RestMethod -Uri $url -Headers $headers -Body $body -Authentication Bearer -Token $token
-    return $response.results.result | Format-Table key, buildstate
+    $Token = (Get-Secret -Name $VaultEntry).Password
+    $Url = "https://bamboo.trimble.tools/rest/api/latest/result/$ProjectKey-$BuildKey"
+    $Headers  = @{ Accept = "application/json" }
+    $Body = @{ "max-results" = $MaxResults; buildstate = $BuildState }
+    $Response =  Invoke-RestMethod -Uri $Url -Headers $Headers -Body $Body -Authentication Bearer -Token $Token
+    return $Response.Results.Result | Format-Table key, buildstate
 }
 
 <#
 .SYNOPSIS
 Pushes latest changes of local Obsidian vault to the remote repository
+
 .DESCRIPTION
 This function executes git add -A, git commit, and git push origin main  in a quick succession to push the latest
 changes of the local copy of an Obisdian vault to the remote repository
@@ -245,146 +388,140 @@ function Push-ObsidianVault {
 
 <#
 .SYNOPSIS
-Search the web using a predefined list of search engines.
+Stops vivaldi.exe forcefully
+
 .DESCRIPTION
-This function builds an appropriate URL given a query and a selected search engine and calls vivaldi browser to
-open it.
-.PARAMETER SearchEngine
-The nickname of the search engine to be used in the search
-.PARAMETER q
-The query string to search for
-.PARAMETER csvFile
-The path to a csv file that describes the URL templates to be used for each search engine
+This function is a shorthand for Stop-Process -Name vivaldi -Force
 #>
-function Search-Web {
-    param(
-        [Parameter(Mandatory=$True)][string] $SearchEngine,
-        [Parameter(Mandatory=$True)][string] $q,
-        [string] $csvFile = "C:\Users\marce\code\PowerShell\searchengines.csv"
-    )
-
-    if(-not (Test-Path $csvFile)) {
-        Write-Output "$csvFile does not describe a file..."
-        return
+function Stop-Vivaldi {
+    try{
+        Stop-Process -Name vivaldi -Force -ErrorAction Stop
     }
-    $searchEngines = ConvertFrom-Csv -InputObject (Get-Content -Path $csvFile -Raw)
-    if ($SearchEngine -notin ($searchengines.nickname)) {
-        write-Output "$searchEngine not recognized as a search engine..."
-        return
+    catch {
+        Write-Error $_
     }
-
-    $url = ($searchEngines | ? nickname -eq $SearchEngine).url -replace "%s", $q
-    $engine = ($searchEngines | ? nickname -eq $SearchEngine).Name -replace "%s", $q
-
-    Write-Output "`$Engine: $searchEngine"
-    Write-Output "`$Query: $q"
-    & vivaldi $url --parent-window
 }
 
-<#function Run-BambooPlan {
-    $VaultEntry = "Bamboo PASS (svcacct_sketchup_devops)"
-    $user = (Get-Secret -Name $VaultEntry).UserName
-    $pass = ConvertFrom-SecureString -SecureString (Get-Secret -Name $VaultEntry).Password -AsPlainText
-    $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f $User,$Pass)))
+<#
+.SYNOPSIS
+Connects to a remote host using TightVNC.
 
-    $projectKey = "SKDEVOPS"
-    $buildKey = "MCT"
-    $baseurl = "bamboo.trimble.tools"
+.DESCRIPTION
+The `Connect-TVNC` function checks if TightVNC is installed on the local machine. If it is installed, it retrieves the TightVNC password from a secret store and uses it to connect to the specified remote host using TightVNC.
 
-    $url = "https://$baseurl/rest/api/latest/queue/$projectKey-$buildKey"
-    $headers = @{Accept = "application/json"; Authorization = ("Basic {0}" -f $base64AuthInfo)}
+.PARAMETER Host
+The IP address of the remote host to connect to. This parameter is mandatory and must be in the format of an IPv4 address.
 
-    echo "`$url: $url"
+.EXAMPLE
+Connect-TVNC -Host "192.168.1.100"
+This command connects to the TightVNC server running on the remote host with IP address 192.168.1.100.
 
-    return (Invoke-RestMethod -uri $url -Headers $headers)
-}#>
-
-<#function Lookup-CrowdinString {
+.NOTES
+- The function assumes that the TightVNC password is stored in a secret named "TightVNC_win".
+- The function uses the TightVNC viewer executable located in the Program Files directory.
+#>
+function Connect-TVNC {
+    [CmdletBinding()]
     param(
-        [string] $id
+        [Parameter(Mandatory=$true)]
+        [ValidateScript({$_ -match "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`$"})]
+        [string] $Host,
+        [string] $VaultEntry = "TightVNC_win"
     )
 
-    $token = (Get-Secret -Name 'Crowdin User Token (marce)').Password
-    $projectId = 305435 # Trimble/SketchUp Client
-    $fileId = 1392 # /develop/client.xliff
-    $url =   "https://crowdin.com/api/v2/projects/$projectId/strings"
-    $body = @{
-        fileId = $fileId
-        limit = 500
+    $InstalledSoftwareKeys = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\
+    if( $InstalledSoftwareKeys | Where-Object -FilterScript {($_.GetValue("DisplayName") -eq "TightVNC") } ) {
+        $password = Get-Secret -Name $VaultEntry | ConvertFrom-SecureString -AsPlainText
+        & $ENV:ProgramFiles\TightVNC\tvnviewer.exe -host="$Host" -port="5900" -password="$password"
+    }
+    else {
+        Write-Error "TightVNC is not installed."
     }
 
-    return Invoke-RestMethod -Uri $url -Body $body -Authentication Bearer -Token $token
-}#>
+}
 
-<#function Get-Time {
+<#
+.SYNOPSIS
+Counts and sums the lengths of items by their file extensions in a specified directory.
+
+.DESCRIPTION
+This function recursively searches through a specified directory and its subdirectories to find all unique file extensions. 
+It then counts the number of files and sums their lengths for each file extension.
+
+.PARAMETER Path
+The path to the directory to search. If not specified, the current directory is used.
+
+.EXAMPLE
+CountByExtension-Items -Path "C:\MyFolder"
+This command will count and sum the lengths of items by their file extensions in the "C:\MyFolder" directory.
+
+.NOTES
+The function uses the `Get-ChildItem` cmdlet to retrieve files and their properties.
+The `Measure-Object` cmdlet is used to count the files and sum their lengths.
+The output is sorted by file extension.
+#>
+function Get-FileExtensionStatistics {
+    [CmdletBinding()]
     param(
-        [string] $Location = "Mexicali"
+        [ValidateScript({ Test-Path $_ -PathType Container })]
+        [string] $Path = (Get-Location).Path
     )
-    $locationEndpoints = @{
-        PST="America/Tijuana"
-        MST="America/Denver"
-        CST="America/Belize"
-        EST="America/New_York"
-        Mexicali = "America/Tijuana"
-        Boulder = "America/Denver"
-        Tokyo = "Asia/Tokyo"
-        Vancouver = "America/Vancouver"
-        Toronto = "America/Toronto"
-        Guadalajara = "America/Mexico_City"
-        Redmond =  "America/Vancouver"
+    $Extensions = Get-ChildItem -File -Recurse -Path $Path | Select-Object -Unique -ExpandProperty Extension 
+    $Output = @()
+    foreach($Extension in $Extensions) {
+        $Measure = Get-ChildItem -Path $Path -Recurse -Filter "*$Extension" | Measure-Object -Property Length -Sum
+        $Output += [pscustomobject] @{
+            Extension = $Extension
+            Count = $Measure.Count
+            TotalLength = [int] $Measure.Sum
+        }
     }
-    $url = "http://worldtimeapi.org/api/timezone/$($locationEndpoints[$Location])"
-    $response = Invoke-RestMethod -Uri $url
-    $date = Get-Date -Date $response.datetime
-    $output = New-Object -TypeName psobject -Property @{
-        Name = $Location
-        TimeZone = $response.abbreviation
-        DateTime = $date.DateTime
-        Time = $date.TimeOfDay.toString()
+    return $Output | Sort-Object -Property Extension
+}
+
+<#
+.SYNOPSIS
+Retrieves the local IPv4/6 addresses and associated interface names of active network adapters.
+
+.DESCRIPTION
+This function gets all network adapters that are currently in an "Up" state, then retrieves their IPv4 addresses.
+It returns a custom object for each IPv4 address, containing the interface name (alias) and the IP address itself.
+
+.EXAMPLE
+Get-LocalIP
+
+Description:
+Returns a list of custom objects, each representing an IPv4 address and its corresponding interface name.
+
+.EXAMPLE
+Get-LocalIP | Format-Table
+
+Description:
+Formats the output of Get-LocalIP into a table for easier reading.
+
+.OUTPUTS
+System.Management.Automation.PSCustomObject[]
+
+.NOTES
+This function relies on the Get-NetAdapter and Get-NetIpAddress cmdlets, which are available on Windows systems.
+
+.LINK
+https://docs.microsoft.com/en-us/powershell/module/netadapter/get-netadapter?view=windowsserver2022-ps
+https://docs.microsoft.com/en-us/powershell/module/nettcpip/get-netipaddress?view=windowsserver2022-ps
+#>
+function Get-LocalIP {
+    $NetAdapter = Get-NetAdapter | Where-Object -Property Status -eq UP
+    return $NetAdapter | Get-NetIpAddress -AddressFamily IPv4, IPv6 | ForEach-Object {
+        [pscustomobject] @{ NetAdapter = $_.InterfaceAlias; IPAddress = $_.IPAddress }
     }
-    return $output
-}#>
+}
 
+Set-Alias -Name ct    -Value Connect-TVNC
+Set-Alias -Name cl    -Value Copy-Location
+Set-Alias -Name gbr   -Value Get-BambooResult
+Set-Alias -Name which -Value Get-CommandPath
+Set-Alias -Name du    -Value Get-FolderSize
+Set-Alias -Name gj    -Value Get-JiraIssue
+Set-Alias -Name kv    -Value Stop-Vivaldi
 
-<#function Update-Commands {
-    param(
-        [Parameter(Mandatory=$true)][string] $id
-    )
-
-    if ((Get-Location).Path -ne (Resolve-Path "~\src\common_application")) {
-        Write-Output "This function needs to run from ~\src\common_application..."
-        return
-    }
-
-    $objList = @()
-
-    $langs = Get-ChildItem -Directory -Path .\commandhelpers `
-        | Where-Object -FilterScript {($_.Name).Length -lt 6} `
-        | Select-Object -ExpandProperty Name
-
-    $langs | %{
-        $lang = $_;
-        $dir = ".\commandhelpers\$lang\commands.json";
-        Write-Output "DIR $dir`a: $(test-path $dir)";
-        $objList += New-Object -TypeName psobject -Property @{
-            lang = $lang
-            jsonObj = (ConvertFrom-Json -InputObject (Get-Content -Path $dir -raw) -depth 10)}
-    }
-
-    # debuging debuging debuging debuging
-    # ($objList | ? lang -eq "cs").jsonObj.list | ? skoreid -eq $id
-    # $objList.jsonObj.list | ? skoreid -eq $id
-    # debuging debuging debuging debuging
-
-    $objList.jsonobj.list | ? skoreid -eq $id | ft skoreid, key, title, menu
-    # $objList | ForEach-Object -Process {
-        # ($_.jsonObj.list) | Where-Object -Property skoreId -eq $id | ft key, title, menu
-        # $entry = ($_.jsonObj.list) | Where-Object -Property skoreId -eq $id
-        # New-Object psobject -property @{lang = $_.lang; title = $entry.title; menu = $entry.menu}
-    # }
-}#>
-
-
-# WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP - WIP 
-
-Export-ModuleMember -Function *
+Export-ModuleMember -Alias * -Function *
